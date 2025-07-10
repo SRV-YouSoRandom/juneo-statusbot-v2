@@ -238,28 +238,63 @@ async def fetch_validator_info(node_id):
     return None
 
 async def fetch_multiple_validators(node_ids):
-    """Fetch validator info for multiple nodes at once"""
+    """
+    Fetch validator info for multiple nodes at once using an efficient,
+    concurrent batching strategy to be a good network citizen.
+    """
     if not node_ids:
         return []
-    
-    payload = {
-        "jsonrpc": "2.0",
-        "method": "platform.getCurrentValidators",
-        "params": {"nodeIDs": node_ids},
-        "id": 1
-    }
 
+    # A safe batch size for public APIs. This prevents requests from being too large.
+    BATCH_SIZE = 15 
+    all_validators = []
+    
+    # Create a list of tasks to run concurrently. Each task fetches one batch.
+    tasks = []
+    
+    # Use a single, persistent aiohttp session for all requests for max efficiency.
     async with aiohttp.ClientSession() as session:
-        try:
-            async with session.post(rpc_url_pchain, json=payload) as resp:
-                if resp.status != 200:
-                    print(f"API request failed with status {resp.status}")
-                    return []
+        for i in range(0, len(node_ids), BATCH_SIZE):
+            batch_of_ids = node_ids[i:i + BATCH_SIZE]
+            
+            payload = {
+                "jsonrpc": "2.0",
+                "method": "platform.getCurrentValidators",
+                "params": {"nodeIDs": batch_of_ids},
+                "id": 1
+            }
+            # Add the task to the list, but don't run it yet.
+            tasks.append(fetch_batch(session, payload))
+
+        # Now, run all the small batch requests concurrently and wait for them all to finish.
+        list_of_results = await asyncio.gather(*tasks)
+
+        # Combine the results from all successful batches into one final list.
+        for validator_batch in list_of_results:
+            if validator_batch:
+                all_validators.extend(validator_batch)
+
+    return all_validators
+
+async def fetch_batch(session, payload):
+    """Helper coroutine to fetch a single batch of validators and handle errors."""
+    node_ids_for_logging = payload['params']['nodeIDs']
+    try:
+        # Set a reasonable timeout for the request.
+        async with session.post(rpc_url_pchain, json=payload, timeout=10) as resp:
+            if resp.status == 200:
                 data = await resp.json()
                 return data.get("result", {}).get("validators", [])
-        except Exception as e:
-            print(f"Error fetching validators: {e}")
-            return []
+            else:
+                # Log an error if a specific batch fails, but don't crash the whole process.
+                print(f"API batch request failed with status {resp.status} for nodes: {node_ids_for_logging}")
+                return []
+    except asyncio.TimeoutError:
+        print(f"API batch request timed out for nodes: {node_ids_for_logging}")
+        return []
+    except Exception as e:
+        print(f"Error fetching validator batch for nodes {node_ids_for_logging}: {e}")
+        return []
 
 async def fetch_peer_info(node_id):
     response = requests.post("https://rpc.juneo-mainnet.network/ext/info", json={
